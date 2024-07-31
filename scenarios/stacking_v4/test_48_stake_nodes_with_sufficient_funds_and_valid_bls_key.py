@@ -15,7 +15,7 @@ from utils.logger import logger
 
 
 # TODO Re-check later on why Epoch 3 is not working properly
-EPOCHS_ID = [4, 5, 6]
+EPOCHS_ID = [4, 5]
 
 
 def epoch_id(val):
