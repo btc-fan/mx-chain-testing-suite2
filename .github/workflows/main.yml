@@ -1,0 +1,168 @@
+name: Build and Test Workflow
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: mx-chain-testing-suite
+    env:
+      BRANCH_NAME: ${{ github.head_ref || github.ref_name }}
+
+    steps:
+      - name: Checkout mx-chain-testing-suite
+        uses: actions/checkout@v2
+        with:
+          repository: 'multiversx/mx-chain-testing-suite'
+          path: 'mx-chain-testing-suite'
+
+      - name: Setup Go 1.20.7
+        uses: actions/setup-go@v2
+        with:
+          go-version: '1.20.7'
+
+      - name: Checkout mx-chain-simulator-go
+        uses: actions/checkout@v2
+        with:
+          repository: 'multiversx/mx-chain-simulator-go'
+          ref: 'rc/v1.7.next1'
+          path: 'mx-chain-simulator-go'
+
+      - name: Build Chain Simulator
+        run: |
+          cd ../mx-chain-simulator-go/cmd/chainsimulator
+          go build -o chainsimulator
+          echo "CHAIN_SIMULATOR_BUILD_PATH=$(pwd)" >> $GITHUB_ENV
+
+      - name: Setup Python 3.10
+        uses: actions/setup-python@v2
+        with:
+          python-version: '3.10'
+
+      - name: Install Dependencies
+        run: |
+          pip install -r requirements.txt
+          echo "PYTHONPATH=." >> $GITHUB_ENV
+
+      - name: Run tests and generate HTML report
+        run: |
+          set +e
+          pytest scenarios/ --html=report.html --self-contained-html --continue-on-collection-errors
+          PYTEST_EXIT_CODE=$?
+          set -e
+          echo "PYTEST_EXIT_CODE=$PYTEST_EXIT_CODE" >> $GITHUB_ENV
+          echo "Pytest exit code: $PYTEST_EXIT_CODE"
+          if [ -f "report.html" ]; then
+          echo "Report generated successfully."
+          mkdir -p ./reports
+          mv report.html ./reports/
+          else
+          echo "Report not found."
+          fi
+
+      - name: Upload test report
+        if: always()
+        uses: actions/upload-artifact@v2
+        with:
+          name: pytest-report-${{ github.run_id }}
+          path: reports/report.html
+
+      - name: Clean up Python cache
+        run: |
+          find . -type f -name "*.pyc" -delete
+          find . -type d -name "__pycache__" -exec rm -rf {} +
+
+      - name: Deploy Report to GitHub Pages
+        if: always()
+        id: deploy_report
+        run: |
+          git config user.name "GitHub Action"
+          git config user.email "action@github.com"
+          if [ -f "reports/report.html" ]; then
+            # Ensure we're on the 'gh-pages' branch and up to date
+            git fetch --all
+            git checkout gh-pages || git checkout --orphan gh-pages
+
+            # Create a new directory for the report based on the current timestamp
+            TIMESTAMP=$(date +'%d%m%Y-%H%M%S')
+            echo "TIMESTAMP=$TIMESTAMP" >> $GITHUB_ENV
+            REPORT_DIR="reports/${BRANCH_NAME}/${TIMESTAMP}"
+            mkdir -p $REPORT_DIR
+
+            # Move the report into the new directory
+            cp reports/report.html $REPORT_DIR/index.html
+
+            # Add and commit the new report
+            git add $REPORT_DIR/index.html
+            git commit -m "Deploy Test Report at $BRANCH_NAME/$TIMESTAMP"
+
+            # Push changes to the remote 'gh-pages' branch
+            git push --force origin gh-pages
+          else
+            echo "Report file not found, skipping deployment."
+          fi
+
+      - name: Update Index Page
+        if: always()
+        run: |
+          if [ -d "docs" ]; then
+            cd docs
+            echo "<html><body><h1>Test Reports</h1><ul>" > index.html
+            for report in $(ls ../reports); do
+              echo "<li><a href='../reports/$report/index.html'>Report - $report</a></li>" >> index.html
+            done
+            echo "</ul></body></html>" >> index.html
+            git add index.html
+            git commit -m "Update Index of Reports"
+            git push origin gh-pages --force
+          else
+            mkdir -p docs
+            cd docs
+            echo "<html><body><h1>Test Reports</h1><ul>" > index.html
+            echo "</ul></body></html>" >> index.html
+            echo "Docs directory was not found and has been created."
+          fi
+
+      - name: Comment PR with report link or error message
+        if: always()
+        uses: actions/github-script@v7
+        env:
+          TIMESTAMP: ${{ env.TIMESTAMP }}
+          BRANCH_NAME: ${{ env.BRANCH_NAME }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const timestamp = process.env.TIMESTAMP;
+            const branchName = process.env.BRANCH_NAME;
+            const issue_number = context.issue.number;
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            let message;
+
+            if (timestamp && branchName && timestamp !== "" && branchName !== "") {
+              const reportUrl = `https://multiversx.github.io/mx-chain-testing-suite/reports/${branchName}/${timestamp}/index.html`;
+              message = `📊 **MultiversX Automated Test Report:** [View Report](${reportUrl})`;
+            } else {
+              message = "⚠️ No report was generated due to an error or cancellation of the process.\nPlease checkout gh action logs for details";
+            }
+
+            github.rest.issues.createComment({
+              issue_number: issue_number,
+              owner: owner,
+              repo: repo,
+              body: message
+            });
+
+      - name: Fail job if tests failed
+        if: always()
+        run: |
+          if [ "${{ env.PYTEST_EXIT_CODE }}" != "0" ]; then
+            echo "Tests failed with exit code ${{ env.PYTEST_EXIT_CODE }}"
+            exit 1
+          else
+            echo "Tests passed successfully."
+          fi

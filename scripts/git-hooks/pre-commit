@@ -1,0 +1,3 @@
+#!/bin/sh
+# Run pre-commit hooks
+pre-commit run --all-files || exit 1
